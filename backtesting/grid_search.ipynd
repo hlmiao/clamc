@@ -1,0 +1,263 @@
+!pip install --upgrade pandas -i https://pypi.tuna.tsinghua.edu.cn/simple
+!pip install xgboost -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+###############################
+import sys
+
+directory = '/home/ec2-user/SageMaker/xgboost-new'
+if directory not in sys.path:
+    sys.path.append(directory)
+
+job_name = 'grid_search'
+image_tag = 'latest'
+###############################
+import boto3
+import sagemaker
+from sagemaker import get_execution_role
+
+role = get_execution_role()
+session = sagemaker.Session()
+aws_default_region = session.boto_session.region_name
+aws_account_id = session.boto_session.client('sts').get_caller_identity()['Account']
+bucket = session.default_bucket()
+
+s3 = boto3.client('s3')
+ecs = boto3.client('ecs')
+
+from sagemaker import image_uris
+print(image_uris.retrieve(framework='xgboost',region='cn-northwest-1',version='1.2-1'))
+###############################
+!aws ecr get-login-password --region {aws_default_region} | docker login --username AWS --password-stdin 451049120500.dkr.ecr.cn-northwest-1.amazonaws.com.cn
+###############################
+%%writefile {directory}/{job_name}/Dockerfile
+FROM 451049120500.dkr.ecr.cn-northwest-1.amazonaws.com.cn/sagemaker-xgboost:1.2-1
+
+RUN pip --no-cache-dir install -i https://pypi.tuna.tsinghua.edu.cn/simple \
+        boto3 \
+        pandas \
+        sklearn
+
+RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && unzip awscliv2.zip && ./aws/install && rm awscliv2.zip && rm -rf aws/
+
+ENV ENVIRONMENT="/home/environment"
+RUN mkdir -p $ENVIRONMENT/input
+RUN mkdir -p $ENVIRONMENT/output
+COPY job.py $ENVIRONMENT/
+CMD aws s3 cp s3://sagemaker-cn-northwest-1-384680359421/grid_search/$TIMESTAMP/trial_$TRIAL/input/ $ENVIRONMENT/input/ --recursive && python $ENVIRONMENT/job.py && aws s3 cp $ENVIRONMENT/output/ s3://sagemaker-cn-northwest-1-384680359421/grid_search/$TIMESTAMP/trial_$TRIAL/output/ --recursive
+###############################
+%%writefile {directory}/{job_name}/job.py
+import json
+import pandas as pd
+from xgboost.sklearn import XGBClassifier
+from sklearn.model_selection import cross_val_score
+
+from timeit import default_timer as timer
+
+__start__ = timer()
+
+
+with open('/home/environment/input/param.json', 'r') as fin:
+    param = json.load(fin)
+print(param)
+model = XGBClassifier(random_state=0, use_label_encoder=False)
+m = model.set_params(**param)
+train_X = pd.read_csv('/home/environment/input/train_X.csv', index_col=0)
+train_Y = pd.read_csv('/home/environment/input/train_Y.csv', index_col=0)
+score = cross_val_score(m, train_X, train_Y, scoring='roc_auc', cv=5, n_jobs=-1).mean()
+
+# 输出
+score = {'score': score}
+with open('/home/environment/output/output.json', 'w') as fout:
+    json.dump(score, fout)
+
+
+run_time = timer() - __start__
+print("Run time %f seconds " % run_time)
+###############################
+!aws ecr create-repository --repository-name {job_name} --region {aws_default_region} > /dev/null
+###############################
+!cd {directory} && docker build {job_name} -t {job_name}:latest
+###############################
+image_uri = '{}.dkr.ecr.{}.amazonaws.com.cn/{}:{}'.format(aws_account_id, aws_default_region, job_name, 'latest')
+exist_image = !docker images -q {job_name}:latest 2> /dev/null
+if len(exist_image) > 0:
+    !docker tag {job_name}:latest {image_uri}
+!$(aws ecr get-login --region {aws_default_region} --no-include-email)
+print('Pushing image')
+!docker push {image_uri}
+print('Done')
+###############################
+import datetime
+import json
+import os
+import time
+import numpy as np
+import pandas as pd
+from functools import reduce
+from xgboost.sklearn import XGBClassifier
+from sklearn.model_selection import cross_val_score
+
+from timeit import default_timer as timer
+_i_ = 0
+###############################
+__start__ = timer()
+
+
+path = directory + '/'
+df_all = pd.read_csv(path + '风格因子数据.csv', converters={'stcode': str}, index_col=0)
+timelist_m = pd.read_csv(path + 'timelist_m.csv', header=None, squeeze=True)
+timelist_m = pd.to_datetime(timelist_m)
+df_all.index = pd.to_datetime(df_all.index)
+
+
+run_time = timer() - __start__
+_i_ += 1
+print(u'Part', _i_, '|', "run time %f seconds " % run_time)
+###############################
+__start__ = timer()
+
+
+#%% 分类算法
+df_all['y_pred'] = np.nan
+df_all['y_pred_rank'] = np.nan
+df_all['group'] = np.nan
+factor_list = ['规模', '估值', '分红', '盈利', '财务质量', '成长', '反转', '波动率', '流动性', '分析师预期变化']
+importance = pd.DataFrame(index=timelist_m[: -1], columns=factor_list)
+auc = pd.DataFrame(index=timelist_m[: -1], columns=['auc'])
+window = 24
+
+
+run_time = timer() - __start__
+_i_ += 1
+print(u'Part', _i_, '|', "run time %f seconds " % run_time)
+###############################
+__start__ = timer()
+
+
+for i in range(len(timelist_m[: -1]) - window):
+    #i=0
+    timestamp = datetime.datetime.strftime(timelist_m[i], '%Y-%m-%d')
+    df_used = df_all.loc[timelist_m[i : i + window]]
+    df_temp = pd.DataFrame(df_used[df_used['flag'] != 0])
+    df_temp['flag'] = ((df_temp['flag']+ 1)/2).astype(int).values
+    train_X = df_temp[factor_list]
+    mean = train_X.mean()
+    std = train_X.std()
+    train_X = (train_X - mean) / std # 标准化
+    train_Y = df_temp['flag']
+    
+    # 调参
+    model = XGBClassifier(random_state=0, use_label_encoder=False)
+    params = {'n_estimators': [50, 250, 500], 'max_depth': [4, 7, 10], 'min_child_weight': [0.2, 0.6, 1], 'gamma': [0.2, 1]}
+    
+    # 两两组合构成参数集
+    param_keys = list(params)
+    param_values = list(params.values())
+    param_values[0] = [[x] for x in param_values[0]]
+    combined_values = reduce(lambda x, y: [i + [j] for i in x for j in y], param_values)
+    param_list = [dict(zip(param_keys, x)) for x in combined_values]
+    task_list = []
+    
+    # 遍历参数集寻找最优参数
+    print('开始参数搜索', timestamp, '，共', len(param_list), '组参数:', end = '')
+    for i, param in enumerate(param_list):
+        s3.put_object(Body=json.dumps(param), Bucket=bucket, Key='{}/{}/trial_{}/input/param.json'.format(job_name, timestamp, str(i)))
+        s3.put_object(Body=train_X.to_csv(), Bucket=bucket, Key='{}/{}/trial_{}/input/train_X.csv'.format(job_name, timestamp, str(i)))
+        s3.put_object(Body=train_Y.to_csv(), Bucket=bucket, Key='{}/{}/trial_{}/input/train_Y.csv'.format(job_name, timestamp, str(i)))
+        r = ecs.run_task(
+            cluster='test',
+            enableExecuteCommand=False,
+            group='family:grid_search',
+            launchType='FARGATE',
+            networkConfiguration={
+                'awsvpcConfiguration': {
+                    'subnets': [
+                        'subnet-1d427657',
+                        'subnet-bc2e99d5',
+                        'subnet-1dd81066',
+                    ],
+                    'securityGroups': [
+                        'sg-0546da2f4b2ead20f',
+                    ],
+                    'assignPublicIp': 'ENABLED'
+                }
+            },
+            overrides={
+                'containerOverrides': [
+                    {
+                        'name': 'job',
+                        'environment': [
+                            {
+                                'name': 'TIMESTAMP',
+                                'value': timestamp
+                            },
+                            {
+                                'name': 'TRIAL',
+                                'value': str(i)
+                            }
+                        ]
+                    },
+                ]
+            },
+            platformVersion='1.4.0',
+            taskDefinition='arn:aws-cn:ecs:cn-northwest-1:384680359421:task-definition/grid_search:4'
+        )
+        task_list.append(r['tasks'][0]['taskArn'])
+    
+    # track 任务的执行状态
+    r = ecs.describe_tasks(cluster='test', tasks=task_list)
+    stopped_count = 0
+    while stopped_count < len(param_list):
+        pending_count = 0
+        running_count = 0
+        stopped_count = 0
+        for i in range(len(r['tasks'])):
+            if r['tasks'][i]['lastStatus'] == 'PENDING':
+                pending_count += 1
+            elif r['tasks'][i]['lastStatus'] == 'RUNNING':
+                running_count += 1
+            elif r['tasks'][i]['lastStatus'] == 'STOPPED':
+                stopped_count += 1
+        print('PENDING JOBS:', pending_count, 'RUNNING JOBS:', running_count, 'STOPPED JOBS:', stopped_count)
+        time.sleep(10)
+        r = ecs.describe_tasks(cluster='test', tasks=task_list)
+        
+    # 获取 score
+    score = []
+    for i, param in enumerate(param_list):
+        key = '{}/{}/trial_{}/output/output.json'.format(job_name, timestamp, str(i))
+        score.append(json.loads(s3.get_object(Bucket=bucket, Key=key)['Body'].read())['score'])
+    
+    # 训练模型
+    best_score = np.max(score)
+    best_param = param_list[np.argmax(score)]
+    print('Best param:', best_param, 'Score:', best_score)
+    model.set_params(**best_param)
+    model_cv = model.fit(train_X, train_Y)
+    
+    # 输出因子数据
+    temp_X_test = df_all[factor_list].loc[timelist_m[i + window]]
+    temp_X_test = (temp_X_test - mean) / std # 标准化
+    
+    auc.loc[timelist_m[i + window - 1], :] = best_score
+    importance.loc[timelist_m[i + window - 1], :] = model_cv.feature_importances_
+    y_pred_temp = pd.Series(model_cv.predict_proba(temp_X_test)[: , 1], index=temp_X_test.index)
+    df_all.loc[timelist_m[i + window], 'y_pred'] = y_pred_temp
+    df_all.loc[timelist_m[i + window], 'y_pred_rank'] = y_pred_temp.rank()
+    df_all.loc[timelist_m[i + window], 'group'] = pd.qcut(df_all.loc[timelist_m[i + window], 'y_pred'], np.arange(0, 1.1, 0.1), labels=np.arange(1, 11)).astype(int)
+
+
+run_time = timer() - __start__
+_i_ += 1
+print(u'Part', _i_, '|', "run time %f seconds " % run_time)
+###############################
+__start__ = timer()
+
+
+df_m = df_all.loc[timelist_m[: -1]].dropna(subset=['group'])
+df_m.reset_index()[['trade_dt', 'stcode', 'y_pred']].to_csv(directory + '/机器学习合成因子_Xgboost.csv')
+
+
+run_time = timer() - __start__
+_i_ += 1
+print(u'Part', _i_, '|', "run time %f seconds " % run_time)
