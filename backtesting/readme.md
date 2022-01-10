@@ -1,14 +1,19 @@
 # 金融行业某买方用户高性能计算解决方案
 
 ## Architectures
+* 行情数据清洗之后，使用该场景进行回测任务，找出分数最高的参数范围
+* 适用于需要大量算力的并行计算场景，可以把已有Python代码放到容器中运行
+* 使用ECS Fargate提供算力，只按运行时间收费，相对本地环境效率更高，费用更低
 
 ![](assets/arch.png)
 
-* 完成L2行情数据清洗之后，使用GridSearch将在给定的参数值上训练给定的估计量。
-* 遍历参数集寻找最优参数，找到给出最高（或最低，如果使用损失函数）得分的参数，选出最优的因子。
-* 使用ECS Fargate为GridSearch提供算力，实现交叉验证。
-
 ## Results
+* 运行日志查看
 
 ![route](assets/results.png)
+
+## Scores
+* 打分结果查看
+
+![route](assets/score.png)
 
